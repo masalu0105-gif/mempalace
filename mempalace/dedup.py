@@ -25,6 +25,7 @@ Usage (from CLI):
 """
 
 import argparse
+import hashlib
 import os
 import time
 from collections import defaultdict
@@ -146,6 +147,40 @@ def dedup_source_group(col, drawer_ids, threshold=DEFAULT_THRESHOLD, dry_run=Tru
     return [k[0] for k in kept], to_delete
 
 
+def count_content_duplicates(col):
+    """Count TRUE content-identical drawers across the whole collection.
+
+    Hashes each drawer's document text (md5) and counts rows that are exact
+    duplicates of another drawer's text. Unlike ``get_source_groups`` (which
+    only groups by source_file and assumes any large same-source group is
+    duplication), this looks at actual content -- a large file chunked into
+    many *unique* pieces (e.g. a big CSV split into hundreds of chunks)
+    correctly contributes 0 here even though it inflates the same-source
+    group size used by the heuristic below.
+
+    Returns (dup_rows, dup_groups): dup_rows is the number of "extra" rows
+    that could be removed (group size - 1, summed over all groups with 2+
+    identical members); dup_groups is how many distinct content values have
+    2+ copies.
+    """
+    total = col.count()
+    seen = defaultdict(int)
+    offset = 0
+    batch_size = 1000
+    while offset < total:
+        batch = col.get(limit=batch_size, offset=offset, include=["documents"])
+        if not batch["ids"]:
+            break
+        for doc in batch["documents"]:
+            h = hashlib.md5((doc or "").encode("utf-8", "replace")).digest()
+            seen[h] += 1
+        offset += len(batch["ids"])
+
+    dup_rows = sum(v - 1 for v in seen.values() if v > 1)
+    dup_groups = sum(1 for v in seen.values() if v > 1)
+    return dup_rows, dup_groups
+
+
 def show_stats(palace_path=None):
     """Show duplication statistics without making changes."""
     palace_path = palace_path or _get_palace_path()
@@ -163,7 +198,19 @@ def show_stats(palace_path=None):
         print(f"    {len(ids):4d}  {src[:65]}")
 
     estimated_dups = sum(int(len(ids) * 0.4) for ids in groups.values() if len(ids) > 20)
-    print(f"\n  Estimated duplicates (groups > 20): ~{estimated_dups:,}")
+    print(
+        f"\n  Same-source drawer count (groups > 20): ~{estimated_dups:,}"
+        "  [NOT a duplicate count -- this is a same-source-file heuristic that"
+        " includes normal large-file chunking (e.g. one big CSV split into many"
+        " unique chunks). See 'True content duplicates' below for real dupes.]"
+    )
+
+    print("\n  Computing true content-hash duplicates (scans every drawer)...")
+    dup_rows, dup_groups = count_content_duplicates(col)
+    print(
+        f"  True content duplicates (identical document text): {dup_rows:,} extra rows"
+        f" across {dup_groups:,} duplicate-content groups"
+    )
 
 
 def dedup_palace(
