@@ -44,6 +44,7 @@ from .palace import (
 # ``mempalace.miner.compute_hallways_for_wing``. The integration call
 # lives at the end of _mine_impl, alongside the existing
 # ``_compute_topic_tunnels_for_wing`` post-mine block.
+from . import content_dedup
 from .collision_scan import assert_no_collisions
 from .hallways import compute_hallways_for_wing
 from .ids import ID_RECIPE, make_drawer_id_from_chunk
@@ -1910,6 +1911,21 @@ def process_file(
             source_file, content
         )
 
+        # Local fork patch (TASK-0091, 2026-09-03): drop chunks whose exact
+        # text is already filed under a *different* source_file, and note the
+        # skipped source on the surviving drawer instead. Runs after the purge
+        # above, so a re-mine of this file no longer sees its own old rows and
+        # rewrites its content normally.
+        #
+        # ``filed_chunks`` replaces ``chunks`` for everything downstream --
+        # notably ``chunk_total`` and the closet's drawer_ids, both of which
+        # must describe the drawers actually written or the next mine sees an
+        # incomplete file (palace.file_already_mined) and closets point at
+        # drawer IDs that were never created.
+        filed_chunks, skipped_chunks = content_dedup.partition_chunks(
+            collection, chunks, source_file
+        )
+
         drawers_added = 0
         # Accumulate drawer metadata across batches so the closet emitter
         # below can consume it (Tier 6a date+line locators). Without this,
@@ -1918,32 +1934,36 @@ def process_file(
         # Per PR #1584 review (Igor, 2026-05-22).
         all_metas: list = []
         try:
-            for batch_start in range(0, len(chunks), DRAWER_UPSERT_BATCH_SIZE):
+            for batch_start in range(0, len(filed_chunks), DRAWER_UPSERT_BATCH_SIZE):
                 batch_docs: list = []
                 batch_ids: list = []
                 batch_metas: list = []
-                for chunk in chunks[batch_start : batch_start + DRAWER_UPSERT_BATCH_SIZE]:
+                for chunk in filed_chunks[batch_start : batch_start + DRAWER_UPSERT_BATCH_SIZE]:
                     drawer_id = make_drawer_id_from_chunk(
                         wing, room, source_file, chunk["chunk_index"]
                     )
                     batch_docs.append(chunk["content"])
                     batch_ids.append(drawer_id)
-                    batch_metas.append(
-                        _build_drawer_metadata(
-                            wing,
-                            room,
-                            source_file,
-                            chunk["chunk_index"],
-                            agent,
-                            chunk["content"],
-                            source_mtime,
-                            line_start=chunk.get("line_start"),
-                            line_end=chunk.get("line_end"),
-                            content_date=file_content_date,
-                            chunk_total=len(chunks),
-                            content_date_source=file_content_date_source,
-                        )
+                    chunk_meta = _build_drawer_metadata(
+                        wing,
+                        room,
+                        source_file,
+                        chunk["chunk_index"],
+                        agent,
+                        chunk["content"],
+                        source_mtime,
+                        line_start=chunk.get("line_start"),
+                        line_end=chunk.get("line_end"),
+                        content_date=file_content_date,
+                        chunk_total=len(filed_chunks),
+                        content_date_source=file_content_date_source,
                     )
+                    # Stamp the per-chunk hash so future mines can match this
+                    # content without rehashing the whole palace.
+                    digest = chunk.get(content_dedup.CONTENT_HASH_KEY)
+                    if digest:
+                        chunk_meta[content_dedup.CONTENT_HASH_KEY] = digest
+                    batch_metas.append(chunk_meta)
                 assert_no_collisions(list(zip(batch_ids, batch_metas)), collection)
                 collection.upsert(
                     documents=batch_docs,
@@ -1971,6 +1991,11 @@ def process_file(
                 purge_file_closets(closets_col, source_file)
             raise
 
+        # Provenance for the chunks this file did not have to store again.
+        # Best-effort by design: losing it costs traceability, never content,
+        # so it must not abort a mine that already succeeded.
+        content_dedup.record_skipped_sources(collection, skipped_chunks, source_file)
+
         # Build closet — the searchable index pointing to these drawers.
         # Purge unconditionally: the old drawers this closet pointed at were
         # already deleted above regardless of how many chunks survived this
@@ -1981,8 +2006,12 @@ def process_file(
         if closets_col:
             purge_file_closets(closets_col, source_file)
         if closets_col and drawers_added > 0:
+            # Must mirror the drawers actually written (TASK-0091): building
+            # this from the full ``chunks`` list would point the closet at
+            # drawer IDs for chunks that were deduped away and never created.
             drawer_ids = [
-                make_drawer_id_from_chunk(wing, room, source_file, c["chunk_index"]) for c in chunks
+                make_drawer_id_from_chunk(wing, room, source_file, c["chunk_index"])
+                for c in filed_chunks
             ]
             # Pass drawer_metas so build_closet_lines can emit the Tier 6a
             # 4-segment pointer (``topic|entities|YYYY-MM-DD:Lstart-Lend|→ids``)

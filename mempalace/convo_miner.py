@@ -20,6 +20,7 @@ from datetime import datetime
 from collections import defaultdict
 from typing import Optional
 
+from . import content_dedup
 from .backends import PalaceNotFoundError
 from .collision_scan import assert_no_collisions
 from .ids import (
@@ -699,13 +700,23 @@ def _file_chunks_locked(
             source_mtime = os.path.getmtime(source_file)
         except OSError:
             source_mtime = None
-        chunk_total = len(chunks)
+        # Local fork patch (TASK-0091, 2026-09-03): drop chunks whose exact
+        # text is already filed under a different source_file. Transcripts are
+        # the largest duplicate source in this palace -- one workflow fan-out
+        # writes the same dispatch prompt into every subagent transcript.
+        # Runs after the purge above so re-mining a file still rewrites its
+        # own content. ``chunk_total`` must count what is actually written or
+        # ``file_already_mined`` treats the file as a crashed partial mine.
+        filed_chunks, skipped_chunks = content_dedup.partition_chunks(
+            collection, chunks, source_file
+        )
+        chunk_total = len(filed_chunks)
         try:
-            for batch_start in range(0, len(chunks), DRAWER_UPSERT_BATCH_SIZE):
+            for batch_start in range(0, len(filed_chunks), DRAWER_UPSERT_BATCH_SIZE):
                 batch_docs: list = []
                 batch_ids: list = []
                 batch_metas: list = []
-                for chunk in chunks[batch_start : batch_start + DRAWER_UPSERT_BATCH_SIZE]:
+                for chunk in filed_chunks[batch_start : batch_start + DRAWER_UPSERT_BATCH_SIZE]:
                     chunk_room = (
                         chunk.get("memory_type", room) if extract_mode == "general" else room
                     )
@@ -740,6 +751,12 @@ def _file_chunks_locked(
                     # it scans all drawers and splits comma-joined hash fields.
                     if content_hash is not None and chunk.get("chunk_index", 0) == 0:
                         meta["content_hash"] = content_hash
+                    # Per-chunk digest under its own key (TASK-0091) -- kept
+                    # distinct from the whole-conversation ``content_hash``
+                    # above, which means something else entirely.
+                    chunk_digest = chunk.get(content_dedup.CONTENT_HASH_KEY)
+                    if chunk_digest:
+                        meta[content_dedup.CONTENT_HASH_KEY] = chunk_digest
                     batch_metas.append(meta)
                 assert_no_collisions(list(zip(batch_ids, batch_metas)), collection)
                 try:
@@ -767,6 +784,10 @@ def _file_chunks_locked(
                     exc_info=True,
                 )
             raise
+
+        # Provenance for chunks this transcript did not have to store again.
+        # Best-effort: losing it costs traceability, never content.
+        content_dedup.record_skipped_sources(collection, skipped_chunks, source_file)
     return drawers_added, room_counts_delta, False
 
 
