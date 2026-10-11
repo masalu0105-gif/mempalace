@@ -708,7 +708,7 @@ def _file_chunks_locked(
         # own content. ``chunk_total`` must count what is actually written or
         # ``file_already_mined`` treats the file as a crashed partial mine.
         filed_chunks, skipped_chunks = content_dedup.partition_chunks(
-            collection, chunks, source_file
+            collection, chunks, source_file, wing=wing
         )
         chunk_total = len(filed_chunks)
         try:

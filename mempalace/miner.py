@@ -1923,7 +1923,7 @@ def process_file(
         # incomplete file (palace.file_already_mined) and closets point at
         # drawer IDs that were never created.
         filed_chunks, skipped_chunks = content_dedup.partition_chunks(
-            collection, chunks, source_file
+            collection, chunks, source_file, wing=wing
         )
 
         drawers_added = 0

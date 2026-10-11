@@ -99,8 +99,12 @@ def _pointer_text(source_file, origin):
     )
 
 
-def _lookup_existing(collection, hashes, source_file):
+def _lookup_existing(collection, hashes, source_file, wing=None):
     """Map hash -> surviving drawer id, for hashes already stored elsewhere.
+
+    When ``wing`` is given only rows in that wing count: the same content
+    mined into a second wing is filed there too, so wing-filtered search
+    still finds it (same scope as upstream's file-level content_hash).
 
     Rows belonging to ``source_file`` itself are ignored: a re-mine deletes
     them first, and counting them would make a file dedup against its own
@@ -111,8 +115,11 @@ def _lookup_existing(collection, hashes, source_file):
     for start in range(0, len(unique), LOOKUP_BATCH):
         batch = unique[start : start + LOOKUP_BATCH]
         try:
+            where = {CONTENT_HASH_KEY: {"$in": batch}}
+            if wing:
+                where = {"$and": [where, {"wing": wing}]}
             res = collection.get(
-                where={CONTENT_HASH_KEY: {"$in": batch}},
+                where=where,
                 include=["metadatas"],
             )
         except Exception:
@@ -132,7 +139,7 @@ def _lookup_existing(collection, hashes, source_file):
     return found
 
 
-def partition_chunks(collection, chunks, source_file, content_key="content"):
+def partition_chunks(collection, chunks, source_file, content_key="content", wing=None):
     """Split ``chunks`` into (kept, skipped) by exact-content duplication.
 
     ``skipped`` entries are ``(chunk, surviving_drawer_id)``.  Duplicates
@@ -153,7 +160,7 @@ def partition_chunks(collection, chunks, source_file, content_key="content"):
 
     hashes = [compute_content_hash(c.get(content_key, "")) for c in chunks]
     try:
-        existing = _lookup_existing(collection, hashes, source_file)
+        existing = _lookup_existing(collection, hashes, source_file, wing=wing)
     except Exception:
         logger.debug("content dedup lookup failed; keeping all chunks", exc_info=True)
         existing = {}
