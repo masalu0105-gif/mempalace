@@ -188,6 +188,23 @@ _MCP_WRITER_LOCK_ERROR = ""
 _MCP_WRITER_ATEXIT_REGISTERED = False
 _MCP_ALLOW_PEER_WRITER_ENV = "MEMPALACE_MCP_ALLOW_PEER_WRITER"
 
+# Writer-lease idle release (local fork patch, TASK-0076).  _start_idle_exit_watchdog kills the
+# whole process to free the lease; that costs a restart plus an embedder cold
+# load.  This lighter watchdog drops ONLY the palace writer lease when no
+# mutating request has run for MEMPALACE_MCP_WRITER_IDLE_MINUTES, leaving the
+# server alive to keep serving reads.  _acquire_mcp_writer_lock already
+# re-attempts the flock on every mutating call, so the lease comes back by
+# itself on the next write -- no extra re-acquire path is needed.  Read-only
+# requests deliberately do NOT refresh the timer: a session that only searches
+# must not keep the daily miner locked out.  Set to 0 to disable.
+_MCP_WRITER_IDLE_MINUTES_ENV = "MEMPALACE_MCP_WRITER_IDLE_MINUTES"
+_MCP_WRITER_IDLE_MINUTES_DEFAULT = 30.0
+_last_mutating_request_time: float = time.monotonic()
+# Held for the whole of one stdio dispatch and by the idle-release watchdog.
+# _release_mcp_writer_lock() closes cached storage handles, so it must never
+# run while a request is using them.
+_MCP_WRITER_LEASE_LOCK = threading.RLock()
+
 _MUTATING_TOOLS = frozenset(
     {
         "mempalace_kg_add",
@@ -502,8 +519,10 @@ def _acquire_mcp_writer_lock() -> tuple[bool, str]:
 
     global _MCP_WRITER_LOCK_CM, _MCP_WRITER_READ_ONLY, _MCP_WRITER_LOCK_FAILED
     global _MCP_WRITER_LOCK_ERROR, _MCP_WRITER_ATEXIT_REGISTERED
+    global _last_mutating_request_time
 
     if _MCP_WRITER_LOCK_CM is not None:
+        _last_mutating_request_time = time.monotonic()
         return True, ""
 
     # Deliberately no sticky failure short-circuit here. A peer can exit, a
@@ -566,6 +585,7 @@ def _acquire_mcp_writer_lock() -> tuple[bool, str]:
     _MCP_WRITER_READ_ONLY = False
     _MCP_WRITER_LOCK_FAILED = False
     _MCP_WRITER_LOCK_ERROR = ""
+    _last_mutating_request_time = time.monotonic()
     return True, ""
 
 
@@ -932,6 +952,18 @@ def _mcp_idle_timeout_secs() -> float:
         except ValueError:
             return 0.0
     return _MCP_IDLE_HOURS_DEFAULT * 3600
+
+
+def _writer_idle_release_secs() -> float:
+    """Return the writer-lease idle-release timeout in seconds (0 = disabled)."""
+    raw = os.environ.get(_MCP_WRITER_IDLE_MINUTES_ENV, "")
+    if raw:
+        try:
+            minutes = float(raw)
+            return max(0.0, minutes) * 60
+        except ValueError:
+            return 0.0
+    return _MCP_WRITER_IDLE_MINUTES_DEFAULT * 60
 
 
 def _resolve_kg_path() -> str:

@@ -105,6 +105,25 @@ def _request_is_mutating(request: dict) -> bool:
     return isinstance(name, str) and name in _MUTATING_TOOLS
 
 
+def _dispatch_stdio_request_under_lease(request: dict):
+    """Dispatch one stdio request with the writer lease pinned for its duration.
+
+    Local fork patch (TASK-0076). ``_release_mcp_writer_lock`` closes the cached
+    Chroma/KG handles, so the idle-release watchdog must not run between a
+    request opening a handle and finishing with it.
+    """
+    global _last_mutating_request_time
+
+    with _MCP_WRITER_LEASE_LOCK:
+        try:
+            return _dispatch_stdio_request(request)
+        finally:
+            # Refresh at completion too, not just at the guard: a long mine
+            # must not count its own runtime as idle time.
+            if _request_is_mutating(request):
+                _last_mutating_request_time = time.monotonic()
+
+
 def _dispatch_stdio_request(request: dict):
     """Route one stdio request: live hub first, local handling otherwise.
 
@@ -192,6 +211,10 @@ def _run_stdio_loop() -> None:
     # that outlived their Claude Code session (#1552).
     _start_idle_exit_watchdog()
 
+    # Idle writer-lease release: give the palace lock back to the daily miner
+    # without killing this server (local fork patch, TASK-0076).
+    _start_writer_idle_release_watchdog()
+
     # Say so when a chromadb write stops coming back, from a thread the stuck
     # call is not blocking.
     _start_write_stall_watchdog()
@@ -233,7 +256,7 @@ def _run_stdio_loop() -> None:
             payload = json.dumps(_json_rpc_parse_error(), ensure_ascii=False)
         else:
             try:
-                response = _dispatch_stdio_request(request)
+                response = _dispatch_stdio_request_under_lease(request)
                 if response is not None:
                     payload = json.dumps(response, ensure_ascii=False)
             except KeyboardInterrupt:

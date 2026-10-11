@@ -1241,6 +1241,61 @@ def _start_idle_exit_watchdog() -> None:
     t.start()
 
 
+def _start_writer_idle_release_watchdog() -> None:
+    """Start a daemon thread that drops the palace writer lease when idle.
+
+    Local fork patch (TASK-0076). Unlike ``_start_idle_exit_watchdog`` this
+    never terminates the process: it releases only the per-palace writer lease
+    so a scheduled miner in another process can take it, and leaves this server
+    alive to serve reads. The lease is reclaimed transparently by
+    ``_acquire_mcp_writer_lock`` on the next mutating tool call.
+
+    Idle is measured from the last MUTATING request, not ``_last_request_time``
+    -- read-only traffic has no reason to keep the palace locked.
+
+    stdio transport only. In HTTP mode the lease is a lifetime lease taken
+    before ``bind``, so silently dropping it would break that startup contract.
+
+    Set ``MEMPALACE_MCP_WRITER_IDLE_MINUTES=0`` to disable.
+    """
+    timeout = _writer_idle_release_secs()
+    if timeout <= 0:
+        return
+    check_interval = min(30.0, timeout / 4)
+
+    def _watchdog() -> None:
+        while True:
+            time.sleep(check_interval)
+            # Cheap unsynchronized pre-checks; both are re-tested under the
+            # lease lock below, which is what actually makes this safe.
+            if _MCP_WRITER_LOCK_CM is None:
+                continue
+            if time.monotonic() - _last_mutating_request_time < timeout:
+                continue
+            with _MCP_WRITER_LEASE_LOCK:
+                if _MCP_WRITER_LOCK_CM is None:
+                    continue
+                idle = time.monotonic() - _last_mutating_request_time
+                if idle < timeout:
+                    continue
+                logger.info(
+                    "MCP writer lease idle for %.1f min (limit %.1f min); "
+                    "releasing the palace lock, server stays up.",
+                    idle / 60,
+                    timeout / 60,
+                )
+                try:
+                    _release_mcp_writer_lock()
+                except Exception:
+                    logger.warning(
+                        "Failed to release idle MCP writer lease; will retry",
+                        exc_info=True,
+                    )
+
+    t = threading.Thread(target=_watchdog, name="mcp-writer-idle-release", daemon=True)
+    t.start()
+
+
 def _json_rpc_error(req_id, code: int, message: str) -> dict:
     return {
         "jsonrpc": "2.0",
