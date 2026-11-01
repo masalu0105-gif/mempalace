@@ -136,8 +136,13 @@ def _dispatch_stdio_request(request: dict):
     """
     import urllib.error
 
+    from ..hub_client import hub_strict, strict_refusal
+
     target = _hub_proxy_target()
     if target is None:
+        if hub_strict():
+            logger.warning("No live palace hub; strict mode refuses to serve this request locally")
+            return strict_refusal(request, None, "no live hub registered")
         return handle_request(request)
     base_url, headers = target
     try:
@@ -150,6 +155,11 @@ def _dispatch_stdio_request(request: dict):
     except (urllib.error.URLError, OSError, TimeoutError, ValueError) as exc:
         reached_hub = isinstance(exc, urllib.error.HTTPError)
         if not reached_hub and not _request_is_mutating(request):
+            if hub_strict():
+                logger.warning(
+                    "Hub at %s unreachable (%s); strict mode refuses local fallback", base_url, exc
+                )
+                return strict_refusal(request, base_url, str(exc))
             logger.warning("Hub at %s unreachable (%s); handling request locally", base_url, exc)
             return handle_request(request)
         if request.get("id") is None:

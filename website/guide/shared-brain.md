@@ -62,6 +62,13 @@ registration file), so plugins and desktop apps join the shared brain — and
 follow a restarted hub — without touching their config. Set
 `MEMPALACE_HUB_FORWARD=0` to opt out.
 
+When the hub is down or too slow to answer, a stdio process falls back to
+serving the palace itself, which loads the whole index into that process.
+On a large palace with many agent sessions open that can exhaust memory. Set
+`MEMPALACE_HUB_STRICT=1` on those stdio entries to refuse the fallback
+instead: the session gets a retryable JSON-RPC error, and resumes proxying as
+soon as a hub is discoverable again, without a restart.
+
 Local agents that speak HTTP natively can also connect directly to
 `http://127.0.0.1:8765/mcp`.
 

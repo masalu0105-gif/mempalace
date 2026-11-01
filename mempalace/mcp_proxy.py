@@ -26,7 +26,13 @@ import logging
 import sys
 import urllib.error
 
-from .hub_client import HUB_FORWARD_ENV, HUB_PROXY_TIMEOUT_S, discover_hub
+from .hub_client import (
+    HUB_FORWARD_ENV,
+    HUB_PROXY_TIMEOUT_S,
+    discover_hub,
+    hub_strict,
+    strict_refusal,
+)
 
 from .update_awareness import cached_update_status, schedule_update_check
 
@@ -250,11 +256,21 @@ def _handle(request: dict, palace_path, local: _LocalServer):
             # Reaching the hub and getting an HTTP error means it may have run
             # the call; so does any mid-flight failure on a mutating tool.
             # Neither may be replayed here.
+            if isinstance(exc, urllib.error.HTTPError):
+                return _proxy_error(request, base_url, exc)
+            if hub_strict():
+                logger.warning(
+                    "Hub at %s unreachable (%s); strict mode refuses local fallback", base_url, exc
+                )
+                return strict_refusal(request, base_url, str(exc))
             module = local.load()
-            if isinstance(exc, urllib.error.HTTPError) or module._request_is_mutating(request):
+            if module._request_is_mutating(request):
                 return _proxy_error(request, base_url, exc)
             logger.warning("Hub at %s unreachable (%s); handling request locally", base_url, exc)
             return _annotate_degraded(module.handle_request(request))
+    if hub_strict():
+        logger.warning("No live palace hub; strict mode refuses to serve this request locally")
+        return strict_refusal(request, None, "no live hub registered")
     module = local.load()
     return _annotate_degraded(module.handle_request(request))
 
@@ -320,7 +336,7 @@ def main() -> None:
         return mcp_server.main()
 
     palace_path = _palace_path(argv)
-    if _hub_target(palace_path) is None:
+    if _hub_target(palace_path) is None and not hub_strict():
         from . import mcp_server
 
         return mcp_server.main()
