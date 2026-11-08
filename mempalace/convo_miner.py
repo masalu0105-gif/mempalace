@@ -302,39 +302,28 @@ def _existing_chunk_digests(collection, source_file: str, extract_mode: str) -> 
     """Describe what is stored for one transcript, for the incremental diff.
 
     Returns ``{"by_digest": {chunk_hash: [(drawer_id, filed_at), ...]},
-    "ids": [every drawer id in scope]}``. Same scoping as
-    :func:`_source_file_delete_ids`. Rows filed by an older normalize/chunker
-    schema, or without a digest, are listed in ``ids`` only, so they are
-    purged and rewritten exactly as the stock path would.
+    "ids": [every drawer id in scope]}``. The id list comes from
+    :func:`_source_file_delete_ids` (same scoping, and the same failure
+    surface: a backend that cannot be read makes this raise, which the caller
+    counts as a purge failure exactly like the stock path). Rows filed by an
+    older normalize/chunker schema, or without a digest, are listed in
+    ``ids`` only, so they are purged and rewritten.
 
     Keyed by digest, not by position: a transcript's room is classified from
     its whole content and can flip as it grows, and the chunker may re-split
     earlier exchanges, so neither chunk_index nor the derived drawer id is a
     stable handle for "the same chunk".
     """
+    ids = _source_file_delete_ids(collection, source_file, extract_mode)
     by_digest: dict = {}
-    ids: list = []
-    offset = 0
-    while True:
-        batch = collection.get(
-            where={"source_file": source_file},
-            limit=1000,
-            offset=offset,
-            include=["metadatas"],
-        )
-        batch_ids = batch.get("ids") or []
-        metadatas = batch.get("metadatas") or []
-        for drawer_id, meta in zip(batch_ids, metadatas):
+    for start in range(0, len(ids), 1000):
+        part = ids[start : start + 1000]
+        got = collection.get(ids=part, include=["metadatas"])
+        for drawer_id, meta in zip(got.get("ids") or [], got.get("metadatas") or []):
             meta = meta or {}
-            if not _metadata_matches_extract_mode(meta, extract_mode):
-                continue
-            ids.append(drawer_id)
             digest = meta.get(content_dedup.CONTENT_HASH_KEY)
             if digest and _meta_is_current(meta, extract_mode):
                 by_digest.setdefault(digest, []).append((drawer_id, meta.get("filed_at")))
-        if not batch_ids:
-            break
-        offset += len(batch_ids)
     return {"by_digest": by_digest, "ids": ids}
 
 
@@ -929,7 +918,17 @@ def _file_chunks_locked(
             )
             # Stale rows go before the writes (same order as the stock purge).
             if stale_ids:
-                collection.delete(ids=stale_ids)
+                try:
+                    collection.delete(ids=stale_ids)
+                except Exception as exc:
+                    print(
+                        f"  ! [error] stale-drawer purge failed for {source_file!r} "
+                        f"({exc!r}); leaving existing drawers untouched, will retry "
+                        f"on the next mine",
+                        file=sys.stderr,
+                    )
+                    logger.debug("Stale-drawer purge failed for %s", source_file, exc_info=True)
+                    return 0, room_counts_delta, PURGE_FAILED
 
             # Kept chunks only need the new pass's bookkeeping (source_mtime,
             # chunk_total, filed_at ...). A metadata-only update never touches
