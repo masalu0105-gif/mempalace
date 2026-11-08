@@ -191,3 +191,4 @@ hub 改成閒置就整個退出、由迴圈 20 秒內重啟：`MEMPALACE_MCP_IDL
 - owner 裁決（21:20）：不走 C2 後備方案，C1 定案。
 - 未做：第 2.4 節 embedder 400 MB；第 2.6 節排程改指 keep 迴圈仍待裁決；`data_level0.bin` 長大另案。
 - 回滾方式不變：還原 `start-mempalace-remote.ps1.bak-20261108-idle-unload`、`git revert fcf44151`、照第 5 節第 4 步重啟。
+- 21:40 owner 裁決第 2.6 節：排程 `MemPalace-Remote-Serve` 改跑 `keep-mempalace-remote.ps1` 迴圈，已完成並驗過（殺 hub 後 20 秒內重開）。hub 的 stderr 現在寫在 `C:\Users\User\Documents\scheduled-task-ops\logs\mempalace-hub\hub-<時間>.stderr.log`，`idle-unload:` 行看那裡。
