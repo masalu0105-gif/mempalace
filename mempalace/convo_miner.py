@@ -37,6 +37,7 @@ from .palace import (
     NORMALIZE_VERSION,
     SKIP_DIRS,
     _metadata_matches_extract_mode,
+    _meta_is_current,
     _validate_palace_fts5_after_mine,
     file_already_mined,
     get_collection,
@@ -281,6 +282,103 @@ def _register_file(
         ids=[sentinel_id],
         metadatas=[meta],
     )
+
+
+def _convo_incremental_enabled() -> bool:
+    """Local fork (2026-11-08): re-mine a changed transcript chunk by chunk.
+
+    A Claude Code transcript only grows, yet the stock path deletes and
+    re-embeds every chunk of the file whenever its mtime moves (73k chunks a
+    night on this palace, each leaving a dead HNSW slot). With this on, chunks
+    whose ``chunk_hash`` is unchanged at the same ``chunk_index`` keep their
+    row and vector and only get fresh metadata. ``MEMPALACE_CONVO_INCREMENTAL=0``
+    restores the full purge-and-rewrite.
+    """
+    raw = os.environ.get("MEMPALACE_CONVO_INCREMENTAL", "1").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def _existing_chunk_digests(collection, source_file: str, extract_mode: str) -> dict:
+    """Describe what is stored for one transcript, for the incremental diff.
+
+    Returns ``{"by_digest": {chunk_hash: [(drawer_id, filed_at), ...]},
+    "ids": [every drawer id in scope]}``. Same scoping as
+    :func:`_source_file_delete_ids`. Rows filed by an older normalize/chunker
+    schema, or without a digest, are listed in ``ids`` only, so they are
+    purged and rewritten exactly as the stock path would.
+
+    Keyed by digest, not by position: a transcript's room is classified from
+    its whole content and can flip as it grows, and the chunker may re-split
+    earlier exchanges, so neither chunk_index nor the derived drawer id is a
+    stable handle for "the same chunk".
+    """
+    by_digest: dict = {}
+    ids: list = []
+    offset = 0
+    while True:
+        batch = collection.get(
+            where={"source_file": source_file},
+            limit=1000,
+            offset=offset,
+            include=["metadatas"],
+        )
+        batch_ids = batch.get("ids") or []
+        metadatas = batch.get("metadatas") or []
+        for drawer_id, meta in zip(batch_ids, metadatas):
+            meta = meta or {}
+            if not _metadata_matches_extract_mode(meta, extract_mode):
+                continue
+            ids.append(drawer_id)
+            digest = meta.get(content_dedup.CONTENT_HASH_KEY)
+            if digest and _meta_is_current(meta, extract_mode):
+                by_digest.setdefault(digest, []).append((drawer_id, meta.get("filed_at")))
+        if not batch_ids:
+            break
+        offset += len(batch_ids)
+    return {"by_digest": by_digest, "ids": ids}
+
+
+def _plan_incremental_writes(planned: list, existing: dict) -> tuple:
+    """Split the planned ``(id, document, metadata)`` rows against what is stored.
+
+    A planned chunk is reused when a current row of this transcript already
+    holds the same ``chunk_hash``: that row keeps its drawer id and its
+    original ``filed_at`` and only receives the new pass's metadata (new
+    chunk_index / room / chunk_total / source_mtime). Everything stored that
+    is not reused is stale.
+
+    Guard: a chunk that must be written derives its id from its new position;
+    if that id is the id of a reused row (the chunks shifted), the reuse is
+    dropped so the write cannot silently overwrite a kept row.
+
+    Returns ``(reuse, to_write, stale_ids)`` with ``reuse`` as
+    ``[(id, metadata)]`` and ``to_write`` as ``[(id, document, metadata)]``.
+    With nothing stored, everything is written and nothing is stale.
+    """
+    by_digest = {k: list(v) for k, v in (existing.get("by_digest") or {}).items()}
+    all_ids = list(existing.get("ids") or [])
+    if not all_ids:
+        return [], list(planned), []
+    reused: dict = {}  # old id -> (metadata, planned row)
+    to_write: list = []
+    for drawer_id, doc, meta in planned:
+        digest = meta.get(content_dedup.CONTENT_HASH_KEY)
+        candidates = by_digest.get(digest) if digest else None
+        if candidates:
+            old_id, old_filed_at = candidates.pop(0)
+            kept_meta = dict(meta, filed_at=old_filed_at) if old_filed_at else meta
+            reused[old_id] = (kept_meta, (drawer_id, doc, meta))
+        else:
+            to_write.append((drawer_id, doc, meta))
+    # Collision guard: a write that targets a reused row's id wins; that row
+    # is rewritten instead of kept.
+    write_ids = {rid for rid, _, _ in to_write}
+    for old_id in [rid for rid in reused if rid in write_ids]:
+        _, row = reused.pop(old_id)
+        to_write.append(row)
+    reuse = [(rid, m) for rid, (m, _) in reused.items()]
+    stale_ids = [rid for rid in all_ids if rid not in reused]
+    return reuse, to_write, stale_ids
 
 
 def _source_file_delete_ids(collection, source_file: str, extract_mode: str) -> list[str]:
@@ -728,10 +826,18 @@ def _file_chunks_locked(
         # already fixed for miner.py at #23). Returning here leaves the old
         # drawers' stored mtime untouched, so the next mine still sees a
         # mismatch and retries.
+        # Local fork (2026-11-08): with incremental re-mine on, the purge is
+        # deferred until the new chunks are known, so unchanged chunks can be
+        # kept instead of deleted and re-embedded. Off -> stock purge here.
+        incremental = _convo_incremental_enabled()
+        existing_digests: dict = {}
         try:
-            delete_ids = _source_file_delete_ids(collection, source_file, extract_mode)
-            if delete_ids:
-                collection.delete(ids=delete_ids)
+            if incremental:
+                existing_digests = _existing_chunk_digests(collection, source_file, extract_mode)
+            else:
+                delete_ids = _source_file_delete_ids(collection, source_file, extract_mode)
+                if delete_ids:
+                    collection.delete(ids=delete_ids)
         except Exception as exc:
             print(
                 f"  ! [error] stale-drawer purge failed for {source_file!r} "
@@ -769,59 +875,78 @@ def _file_chunks_locked(
         )
         chunk_total = len(filed_chunks)
         try:
-            for batch_start in range(0, len(filed_chunks), DRAWER_UPSERT_BATCH_SIZE):
-                batch_docs: list = []
-                batch_ids: list = []
-                batch_metas: list = []
-                for chunk in filed_chunks[batch_start : batch_start + DRAWER_UPSERT_BATCH_SIZE]:
-                    chunk_room = (
-                        chunk.get("memory_type", room) if extract_mode == "general" else room
-                    )
-                    if extract_mode == "general":
-                        room_counts_delta[chunk_room] += 1
-                    drawer_id = make_convo_drawer_id(
-                        wing, chunk_room, source_file, extract_mode, chunk["chunk_index"]
-                    )
-                    batch_docs.append(chunk["content"])
-                    batch_ids.append(drawer_id)
-                    meta = {
-                        "wing": wing,
-                        "room": chunk_room,
-                        "hall": _detect_hall_cached(chunk["content"]),
-                        "source_file": source_file,
-                        "chunk_index": chunk["chunk_index"],
-                        "added_by": agent,
-                        "filed_at": filed_at,
-                        "entities": entities_metadata(chunk["content"]),
-                        "authored_at": authored_at if authored_at is not None else filed_at,
-                        "ingest_mode": "convos",
-                        "extract_mode": extract_mode,
-                        "normalize_version": NORMALIZE_VERSION,
-                        "id_recipe": ID_RECIPE,
-                        "chunk_total": chunk_total,
-                    }
-                    if extract_mode == "exchange":
-                        meta["convo_chunker_version"] = CONVO_CHUNKER_VERSION
-                    if source_mtime is not None:
-                        meta["source_mtime"] = source_mtime
-                    if source_dir_ino:
-                        # Which directory this transcript was read from, so
-                        # ``sync`` can tell a neighbour in the same directory
-                        # from one on a volume mounted there since (#2320).
-                        meta["source_dir_ino"] = source_dir_ino
-                    # Stamp content_hash only on chunk 0 so multi-conversation
-                    # privacy-export hashes are not O(N²)-duplicated across every
-                    # chunk row. ``prefetch_content_hashes`` still finds them —
-                    # it scans all drawers and splits comma-joined hash fields.
-                    if content_hash is not None and chunk.get("chunk_index", 0) == 0:
-                        meta["content_hash"] = content_hash
-                    # Per-chunk digest under its own key (TASK-0091) -- kept
-                    # distinct from the whole-conversation ``content_hash``
-                    # above, which means something else entirely.
-                    chunk_digest = chunk.get(content_dedup.CONTENT_HASH_KEY)
-                    if chunk_digest:
-                        meta[content_dedup.CONTENT_HASH_KEY] = chunk_digest
-                    batch_metas.append(meta)
+            # Build every (id, document, metadata) first so the incremental
+            # diff below can see the whole new set before touching the palace.
+            planned: list = []
+            for chunk in filed_chunks:
+                chunk_room = chunk.get("memory_type", room) if extract_mode == "general" else room
+                if extract_mode == "general":
+                    room_counts_delta[chunk_room] += 1
+                drawer_id = make_convo_drawer_id(
+                    wing, chunk_room, source_file, extract_mode, chunk["chunk_index"]
+                )
+                meta = {
+                    "wing": wing,
+                    "room": chunk_room,
+                    "hall": _detect_hall_cached(chunk["content"]),
+                    "source_file": source_file,
+                    "chunk_index": chunk["chunk_index"],
+                    "added_by": agent,
+                    "filed_at": filed_at,
+                    "entities": entities_metadata(chunk["content"]),
+                    "authored_at": authored_at if authored_at is not None else filed_at,
+                    "ingest_mode": "convos",
+                    "extract_mode": extract_mode,
+                    "normalize_version": NORMALIZE_VERSION,
+                    "id_recipe": ID_RECIPE,
+                    "chunk_total": chunk_total,
+                }
+                if extract_mode == "exchange":
+                    meta["convo_chunker_version"] = CONVO_CHUNKER_VERSION
+                if source_mtime is not None:
+                    meta["source_mtime"] = source_mtime
+                if source_dir_ino:
+                    # Which directory this transcript was read from, so
+                    # ``sync`` can tell a neighbour in the same directory
+                    # from one on a volume mounted there since (#2320).
+                    meta["source_dir_ino"] = source_dir_ino
+                # Stamp content_hash only on chunk 0 so multi-conversation
+                # privacy-export hashes are not O(N²)-duplicated across every
+                # chunk row. ``prefetch_content_hashes`` still finds them —
+                # it scans all drawers and splits comma-joined hash fields.
+                if content_hash is not None and chunk.get("chunk_index", 0) == 0:
+                    meta["content_hash"] = content_hash
+                # Per-chunk digest under its own key (TASK-0091) -- kept
+                # distinct from the whole-conversation ``content_hash``
+                # above, which means something else entirely.
+                chunk_digest = chunk.get(content_dedup.CONTENT_HASH_KEY)
+                if chunk_digest:
+                    meta[content_dedup.CONTENT_HASH_KEY] = chunk_digest
+                planned.append((drawer_id, chunk["content"], meta))
+
+            reuse, to_write, stale_ids = _plan_incremental_writes(
+                planned, existing_digests if incremental else {}
+            )
+            # Stale rows go before the writes (same order as the stock purge).
+            if stale_ids:
+                collection.delete(ids=stale_ids)
+
+            # Kept chunks only need the new pass's bookkeeping (source_mtime,
+            # chunk_total, filed_at ...). A metadata-only update never touches
+            # the vector segment, so no dead HNSW slot is produced.
+            for batch_start in range(0, len(reuse), DRAWER_UPSERT_BATCH_SIZE):
+                part = reuse[batch_start : batch_start + DRAWER_UPSERT_BATCH_SIZE]
+                collection.update(
+                    ids=[rid for rid, _ in part],
+                    metadatas=[m for _, m in part],
+                )
+            drawers_kept = len(reuse)
+
+            for batch_start in range(0, len(to_write), DRAWER_UPSERT_BATCH_SIZE):
+                part = to_write[batch_start : batch_start + DRAWER_UPSERT_BATCH_SIZE]
+                batch_ids = [rid for rid, _, _ in part]
+                batch_docs = [doc for _, doc, _ in part]
+                batch_metas = [m for _, _, m in part]
                 assert_no_collisions(list(zip(batch_ids, batch_metas)), collection)
                 try:
                     collection.upsert(
@@ -833,6 +958,14 @@ def _file_chunks_locked(
                 except Exception as e:
                     if "already exists" not in str(e).lower():
                         raise
+            if drawers_kept:
+                logger.info(
+                    "incremental re-mine %s: kept %d, wrote %d, removed %d",
+                    source_file,
+                    drawers_kept,
+                    len(to_write),
+                    len(stale_ids),
+                )
         except Exception:
             # A successful earlier batch has the source's current mtime and
             # chunk_total. Leaving those drawers behind would make the next
