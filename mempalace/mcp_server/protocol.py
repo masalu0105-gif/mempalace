@@ -1282,6 +1282,114 @@ def _start_idle_exit_watchdog() -> None:
     t.start()
 
 
+# ---- HTTP idle unload (local fork, 2026-11-08) ------------------------------
+# A long-lived hub keeps the whole HNSW index resident (~3.8 GB commit measured
+# on the 2026-11-08 palace). Closing the palace handles while nobody is querying
+# returns that memory to the OS (2,087 -> 93 MB measured in a clean process);
+# the next request reopens them lazily via _get_collection() (~2.8 s). Unlike
+# _start_idle_exit_watchdog the process and its listening port stay up, and the
+# lifetime writer lease taken at HTTP startup is never touched.
+
+
+def _http_idle_unload_secs() -> float:
+    """Idle threshold in seconds from ``MEMPALACE_HTTP_IDLE_UNLOAD_MINUTES``.
+
+    Unset, empty, ``0``, negative or unparsable all mean disabled (0.0), so the
+    upstream default behaviour is unchanged unless an operator opts in.
+    """
+    raw = os.environ.get("MEMPALACE_HTTP_IDLE_UNLOAD_MINUTES", "").strip()
+    if not raw:
+        return 0.0
+    try:
+        minutes = float(raw)
+    except ValueError:
+        return 0.0
+    return max(0.0, minutes) * 60.0
+
+
+def _process_commit_mb() -> int:
+    """Private (committed) bytes of this process in MB; -1 when psutil is absent."""
+    try:
+        import psutil
+
+        return int(psutil.Process().memory_info().private // (1024 * 1024))
+    except Exception:  # noqa: BLE001 - diagnostics only
+        return -1
+
+
+# ``_last_request_time`` value seen at the last unload. The palace backend
+# keeps its own handle cache (``_collection_cache`` stays None on the hub even
+# with 3 GB of index resident), so "already unloaded" is defined as "no request
+# has been handled since the last unload", not by inspecting those caches.
+_http_idle_unload_mark: float = -1.0
+
+
+def _http_idle_unload_once(timeout: float) -> bool:
+    """Close the palace handles if the hub has been idle for ``timeout`` seconds.
+
+    Returns True only when handles were actually closed. Never blocks on a
+    running mine (``_HTTP_MINE_LOCK`` is tried, not waited for); lock order is
+    the same as reconnect: mine -> embedding lifecycle -> exclusive request.
+    """
+    global _http_idle_unload_mark
+    if _last_request_time == _http_idle_unload_mark:
+        return False  # nothing has been opened since the last unload
+    if time.monotonic() - _last_request_time < timeout:
+        return False
+    if not _HTTP_MINE_LOCK.acquire(blocking=False):
+        return False  # a mine is in progress; leave its handles alone
+    try:
+        with _http_embedding_lifecycle(), _HTTP_REQUEST_LOCK:
+            last_seen = _last_request_time
+            idle = time.monotonic() - last_seen
+            if idle < timeout:
+                return False  # a request arrived while we waited for the locks
+            before = _process_commit_mb()
+            errors = _close_palace_handles()
+            import gc
+
+            gc.collect()
+            _http_idle_unload_mark = last_seen
+            logger.info(
+                "idle-unload: palace handles closed after %.0fs idle; commit %d -> %d MB%s",
+                idle,
+                before,
+                _process_commit_mb(),
+                ("; errors: " + "; ".join(errors)) if errors else "",
+            )
+            return True
+    finally:
+        _HTTP_MINE_LOCK.release()
+
+
+def _start_http_idle_unload_watchdog() -> None:
+    """Start the daemon thread that unloads palace handles when the hub idles.
+
+    HTTP transport only. Disabled unless ``MEMPALACE_HTTP_IDLE_UNLOAD_MINUTES``
+    parses to a positive number. A failing unload is logged and retried on the
+    next tick; it never ends the thread.
+    """
+    timeout = _http_idle_unload_secs()
+    if timeout <= 0:
+        return
+    check_interval = min(60.0, timeout / 4)
+    logger.info(
+        "idle-unload watchdog armed: unload palace handles after %.0fs idle (tick %.1fs)",
+        timeout,
+        check_interval,
+    )
+
+    def _loop() -> None:
+        while True:
+            time.sleep(check_interval)
+            try:
+                _http_idle_unload_once(timeout)
+            except Exception:  # noqa: BLE001 - keep the watchdog alive
+                logger.exception("idle-unload watchdog failed; will retry")
+
+    threading.Thread(target=_loop, name="mcp-http-idle-unload", daemon=True).start()
+
+
 def _start_writer_idle_release_watchdog() -> None:
     """Start a daemon thread that drops the palace writer lease when idle.
 
