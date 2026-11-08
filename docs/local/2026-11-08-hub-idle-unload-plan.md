@@ -179,3 +179,15 @@ hub 改成閒置就整個退出、由迴圈 20 秒內重啟：`MEMPALACE_MCP_IDL
 
 ## 8. 時程估計
 改碼＋測試 1.5–2 小時；真機驗收 40 分（含等閒置）；切正式 hub 10 分。
+
+## 9. 執行紀錄（2026-11-08 20:50–21:30，執行者：Claude Code 新對話）
+
+- 開工時發現 hub 沒在跑：機器 20:39 重開，排程 20:39:34 啟動時 Tailscale IP 還沒就緒，`WinError 10049` 綁位址失敗但退出碼 0；Startup-Watch 開機 8 分鐘內跳過，20:47 才拉回。啟動腳本已加「先等 IP 出現（最多 120 秒）」。
+- 程式：`_close_palace_handles()` 抽出、`_http_idle_unload_once()`／`_start_http_idle_unload_watchdog()` 加進 protocol.py、runtime 掛鉤；commit `b1ac305c`，merge `fcf44151`，push fork main 一致。
+- 與第 2.3 節設計不同的一點：**不能用 `_collection_cache is None` 判斷「已卸載」**。實測 hub 載了 3 GB 索引時 `_collection_cache` 仍是 None（把手在 palace backend 自己的快取裡），watchdog 因此每輪都跳過。改成記「上次卸載時的 `_last_request_time`」，相同就表示沒有新請求、不重複卸載。
+- 測試：`tests/test_http_idle_unload.py` 8 條＋計畫書列的 6 個既有測試檔，共 122 passed；ruff check／format 全過。
+- 唯讀測試 hub（8766，門檻 1 分）：載入 3,132 MB → 卸載後 1,112 MB → 重開搜尋 2.62 秒有結果。門檻 1,000 MB 差 112 MB；該程序一啟動就 707 MB（套件＋embedder），索引那 2.4 GB 還回 2.0 GB。
+- 正式 hub（8765，門檻 20 分）：21:07:47 搜尋後 2,498 MB → 21:28 卸載 2,492 → 499 MB（log：`idle-unload: palace handles closed after 1259s idle`）→ 21:30 新 `claude -p` 搜尋正常回結果 → 2,501 MB。**門檻 <1,000 MB 通過**。正式 hub 啟動基線只有 106 MB（測試 hub 的 707 MB 差在啟動方式，沒深究）。
+- owner 裁決（21:20）：不走 C2 後備方案，C1 定案。
+- 未做：第 2.4 節 embedder 400 MB；第 2.6 節排程改指 keep 迴圈仍待裁決；`data_level0.bin` 長大另案。
+- 回滾方式不變：還原 `start-mempalace-remote.ps1.bak-20261108-idle-unload`、`git revert fcf44151`、照第 5 節第 4 步重啟。
