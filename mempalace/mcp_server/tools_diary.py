@@ -404,8 +404,21 @@ def tool_reconnect():
         return _tool_reconnect_locked()
 
 
-def _tool_reconnect_locked():
-    """Reconnect body; caller holds the embedding lifecycle lock."""
+def _close_palace_handles() -> list:
+    """Close every cached palace handle without reopening anything.
+
+    The first half of ``_tool_reconnect_locked``: backend ``close_palace``,
+    the MCP-local Chroma client, the process-global Chroma system cache, the
+    HNSW capacity probe cache, and the per-path KnowledgeGraph / Logstream
+    caches. Leaves ``_client_cache`` / ``_collection_cache`` as ``None`` so
+    the next ``_get_collection()`` reopens lazily. Returns the list of
+    non-fatal close errors (empty when everything closed cleanly).
+
+    Local fork (2026-11-08, hub idle unload): also called by the HTTP idle
+    watchdog so a long-lived hub can hand the vector index back to the OS
+    while nobody is querying. Caller must hold the embedding lifecycle lock
+    and an exclusive request lease.
+    """
     global \
         _client_cache, \
         _collection_cache, \
@@ -486,6 +499,12 @@ def _tool_reconnect_locked():
             except Exception:
                 pass
         _logstream_by_path.clear()
+    return close_errors
+
+
+def _tool_reconnect_locked():
+    """Reconnect body; caller holds the embedding lifecycle lock."""
+    close_errors = _close_palace_handles()
     _refresh_sqlite_integrity_status()
     if _sqlite_integrity_errors:
         result = {

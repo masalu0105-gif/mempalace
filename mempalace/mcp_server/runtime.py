@@ -410,6 +410,7 @@ def _run_http_loop() -> None:
         # soon as the process is alive.
         _refresh_vector_disabled_flag()
         _start_idle_exit_watchdog()
+        _start_http_idle_unload_watchdog()
         _start_write_stall_watchdog()
 
         raw_warmup = os.environ.get("MEMPALACE_EAGER_WARMUP", "").strip().lower()
